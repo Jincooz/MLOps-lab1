@@ -1,0 +1,179 @@
+volumes:
+  minio-data:
+  mlflow-data:
+  airflow-db:
+  airflow-logs:
+
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: mlflow-minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio-data:/data
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${MINIO_PORT}/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  create-bucket:
+    image: minio/mc:latest
+    container_name: mlflow-create-bucket
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        mc alias set myminio "http://${MINIO_HOST}:${MINIO_PORT}" \
+          "${MINIO_ROOT_USER}" "${MINIO_ROOT_PASSWORD}"
+        mc mb --ignore-existing "myminio/${MLFLOW_BUCKET:-mlflow}"
+        mc mb --ignore-existing "myminio/${DATASETS_BUCKET:-datasets}"
+        mc mb --ignore-existing "myminio/${INFERENCE_LOGS_BUCKET:-op-store}"
+    restart: "no"
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:${MLFLOW_VERSION}
+    container_name: mlflow-server
+    depends_on:
+      minio:
+        condition: service_healthy
+      create-bucket:
+        condition: service_completed_successfully
+    environment:
+      MLFLOW_BACKEND_STORE_URI: ${MLFLOW_BACKEND_STORE_URI}
+
+      MLFLOW_S3_ENDPOINT_URL: ${MLFLOW_S3_ENDPOINT_URL}
+      MLFLOW_ARTIFACTS_DESTINATION: ${MLFLOW_ARTIFACTS_DESTINATION}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+      MLFLOW_S3_IGNORE_TLS: "true"  # We're not using SSL since it's local
+
+      MLFLOW_HOST: ${MLFLOW_HOST}
+      MLFLOW_PORT: ${MLFLOW_PORT}
+
+      MLFLOW_SERVER_ALLOWED_HOSTS: "mlflow:*,localhost:*,127.0.0.1:*"
+
+    volumes:
+      - mlflow-data:/mlflow
+
+    command:
+      - /bin/bash
+      - -c
+      - |
+        pip install --no-cache-dir boto3
+        mlflow server \
+          --backend-store-uri "${MLFLOW_BACKEND_STORE_URI}" \
+          --artifacts-destination "${MLFLOW_ARTIFACTS_DESTINATION}" \
+          --serve-artifacts \
+          --host "${MLFLOW_HOST}" \
+          --port "${MLFLOW_PORT}"
+    ports:
+      - "${MLFLOW_PORT}:${MLFLOW_PORT}"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:${MLFLOW_PORT}/health')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  preprocessing:
+    build: ./preprocessing_service
+    container_name: preprocessing
+
+  modelapi:
+    build: ./model_service
+    container_name: modelapi
+    depends_on:
+      minio:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+      create-bucket:
+        condition: service_completed_successfully
+      preprocessing:
+        condition: service_started
+    environment:
+      MODEL_NAME: ${MODEL_NAME}
+      MODEL_VERSION: ${MODEL_VERSION}
+      MLFLOW_URL: http://mlflow:${MLFLOW_PORT}
+      STORAGE_URL: http://minio:${MINIO_PORT}
+      DATA_BUCKET: ${INFERENCE_LOGS_BUCKET}
+      STORAGE_USER: ${MINIO_ROOT_USER}
+      STORAGE_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      PREPROCESSING_URL: http://preprocessing:${PREPROCESING_PORT}
+    ports:
+      - "${MODELAPI_PORT}:${MODELAPI_PORT}"
+
+  training:
+    build: ./training_process
+    container_name: training_process
+    depends_on:
+      minio:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+      create-bucket:
+        condition: service_completed_successfully
+      preprocessing:
+        condition: service_started
+    environment:
+      MLFLOW_URL: http://mlflow:${MLFLOW_PORT}
+      STORAGE_URL: http://minio:${MINIO_PORT}
+      DATA_BUCKET: ${DATASETS_BUCKET}
+      STORAGE_USER: ${MINIO_ROOT_USER}
+      STORAGE_PASSWORD: ${MINIO_ROOT_PASSWORD}
+
+  airflow:
+    image: apache/airflow:2.9.3
+    container_name: airflow
+    restart: always
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/airflow.db
+
+      STORAGE_URL: http://minio:${MINIO_PORT}
+      STORAGE_USER: ${MINIO_ROOT_USER}
+      STORAGE_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      DATASET_BUCKET: ${DATASETS_BUCKET}
+      OPERATION_BUCKET: ${INFERENCE_LOGS_BUCKET}
+      PREPROCESSING_URL: http://preprocessing:${PREPROCESING_PORT}
+
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - airflow-logs:/opt/airflow/logs
+      - airflow-db:/opt/airflow
+
+    ports:
+      - "8080:8080"
+
+    command: >
+      bash -c "
+      airflow db migrate &&
+      airflow users create --username admin --firstname FIRST_NAME --lastname LAST_NAME --role Admin --email admin@example.org --password admin &&
+      airflow webserver --port 8080 & 
+      exec airflow scheduler
+      "
+
+
+networks:
+  default:
+    name: mlflow-network
